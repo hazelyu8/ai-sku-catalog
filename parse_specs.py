@@ -1,125 +1,82 @@
-import sqlite3
-import pytesseract
-from PIL import Image
-import re
-import pandas as pd
-from docx import Document
 import os
+import glob
+import sqlite3
+from langchain.agents import initialize_agent, Tool
+from langchain_openai import ChatOpenAI
+
+# --- Your existing pipeline ---
+from parse_specs import extract_text, parse_vendor_doc, save_to_db, export_to_excel_template
 
 # ------------------------
-# 1. Extract text (image OR docx)
+# 1. Tool wrapper for your pipeline
 # ------------------------
-def extract_text(file_path):
-    ext = os.path.splitext(file_path)[1].lower()
+def process_vendor_file(file_path: str):
+    """Process a vendor doc/image and update DB + Excel."""
+    raw_text = extract_text(file_path)
+    fields = parse_vendor_doc(raw_text)
+    save_to_db(fields)
+    export_to_excel_template(fields, "data/specs/sample_specs.xlsx")
+    return f"✅ Processed {file_path} and added {fields.get('SKU')} to Excel."
 
-    if ext in [".jpg", ".jpeg", ".png"]:
-        img = Image.open(file_path)
-        text = pytesseract.image_to_string(img)
-        return text
+def process_latest_file(folder="data/specs/"):
+    """Find latest file in data/specs and process it."""
+    files = glob.glob(os.path.join(folder, "*.docx")) + \
+            glob.glob(os.path.join(folder, "*.jpg")) + \
+            glob.glob(os.path.join(folder, "*.jpeg")) + \
+            glob.glob(os.path.join(folder, "*.png"))
+    if not files:
+        return "❌ No files found in data/specs/"
+    latest = max(files, key=os.path.getmtime)
+    return process_vendor_file(latest)
 
-    elif ext == ".docx":
-        doc = Document(file_path)
-        text = "\n".join([p.text for p in doc.paragraphs if p.text.strip()])
-        return text
-
-    else:
-        raise ValueError(f"Unsupported file type: {ext}")
-
-# ------------------------
-# 2. Parse vendor document
-# ------------------------
-def parse_vendor_doc(text):
-    fields = {
-        "Customer": None,
-        "Product Description": None,
-        "Batch/Lot No.": None,
-        "Date": None,
-        "SKU": None,
-        "Qty": None
-    }
-
-    # Regex with re.MULTILINE and case-insensitive
-    cust_match = re.search(r"Customer[:\-]?\s*(.+)", text, re.MULTILINE | re.IGNORECASE)
-    prod_match = re.search(r"(Product Description|Description)[:\-]?\s*(.+)", text, re.MULTILINE | re.IGNORECASE)
-    lot_match = re.search(r"(Batch/Lot No\.?|Lot)[:\-]?\s*(.+)", text, re.MULTILINE | re.IGNORECASE)
-    date_match = re.search(r"Date[:\-]?\s*(.+)", text, re.MULTILINE | re.IGNORECASE)
-    sku_match = re.search(r"SKU[:\-]?\s*(.+)", text, re.MULTILINE | re.IGNORECASE)
-    qty_match = re.search(r"(Qty|Quantity)[:\-]?\s*(\d+)", text, re.MULTILINE | re.IGNORECASE)
-
-    if cust_match: fields["Customer"] = cust_match.group(1).strip()
-    if prod_match: fields["Product Description"] = prod_match.group(2).strip()
-    if lot_match: fields["Batch/Lot No."] = lot_match.group(2).strip()
-    if date_match: fields["Date"] = date_match.group(1).strip()
-    if sku_match: fields["SKU"] = sku_match.group(1).strip()
-    if qty_match: fields["Qty"] = qty_match.group(2).strip()
-
-    return fields
-
-# ------------------------
-# 3. Save to SQLite (with duplicate check)
-# ------------------------
-def save_to_db(fields):
+def get_last_sku():
+    """Fetch the last SKU stored in the database."""
     conn = sqlite3.connect("sku_catalog.db")
     cur = conn.cursor()
+    cur.execute("SELECT sku, batch_lot, qty, date FROM sku_catalog ORDER BY id DESC LIMIT 1")
+    row = cur.fetchone()
+    conn.close()
+    if row:
+        return f"📦 Last entry → SKU: {row[0]}, Lot: {row[1]}, Qty: {row[2]}, Date: {row[3]}"
+    else:
+        return "❌ No SKUs found in database."
 
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS sku_catalog (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        customer TEXT,
-        product_desc TEXT,
-        batch_lot TEXT,
-        date TEXT,
-        sku TEXT UNIQUE,
-        qty INTEGER
+# ------------------------
+# 2. Define tools for the agent
+# ------------------------
+tools = [
+    Tool(
+        name="Process Vendor File",
+        func=process_vendor_file,
+        description="Process a specific vendor doc/image by giving its file path."
+    ),
+    Tool(
+        name="Process Latest File",
+        func=process_latest_file,
+        description="Process the latest vendor doc/image from data/specs/."
+    ),
+    Tool(
+        name="Get Last SKU",
+        func=get_last_sku,
+        description="Fetch the last SKU that was added to the database."
     )
-    """)
-
-    try:
-        cur.execute("""
-        INSERT INTO sku_catalog (customer, product_desc, batch_lot, date, sku, qty)
-        VALUES (?, ?, ?, ?, ?, ?)
-        """, (
-            fields["Customer"], fields["Product Description"], fields["Batch/Lot No."],
-            fields["Date"], fields["SKU"], fields["Qty"]
-        ))
-        conn.commit()
-        print("✅ Entry saved to database.")
-    except sqlite3.IntegrityError:
-        print("⚠️ Duplicate entry skipped (same SKU already exists).")
-
-    conn.close()
+]
 
 # ------------------------
-# 4. Export DB → Excel + Preview
+# 3. Create the ChatGPT agent
 # ------------------------
-def export_to_excel():
-    conn = sqlite3.connect("sku_catalog.db")
-    df = pd.read_sql_query("SELECT * FROM sku_catalog", conn)
-    df.to_excel("sku_catalog.xlsx", index=False)
-    conn.close()
-    print("📊 Excel export updated: sku_catalog.xlsx")
-
-    # Show preview in terminal
-    print("\n🔎 Current Catalog Preview:")
-    print(df.to_string(index=False))
+llm = ChatOpenAI(temperature=0, model="gpt-4o-mini")  # use GPT-4o-mini for speed
+agent = initialize_agent(tools, llm, agent="zero-shot-react-description", verbose=True)
 
 # ------------------------
-# 5. Run the agent
+# 4. Chat loop
 # ------------------------
 if __name__ == "__main__":
-    # Swap this path to test with either .jpg/.png or .docx
-    file_path = "data/specs/smolder_eyes_document.docx"
-
-    # Step 1: Extract text
-    raw_text = extract_text(file_path)
-    print("🔎 Extracted Text:\n", raw_text)
-
-    # Step 2: Parse fields
-    fields = parse_vendor_doc(raw_text)
-    print("📦 Parsed Fields:", fields)
-
-    # Step 3: Save to DB
-    save_to_db(fields)
-
-    # Step 4: Update Excel + preview
-    export_to_excel()
+    print("🤖 AI SKU Agent is ready! Type 'exit' to quit.\n")
+    while True:
+        user_input = input("You: ")
+        if user_input.lower() in ["exit", "quit"]:
+            print("👋 Goodbye!")
+            break
+        response = agent.run(user_input)
+        print("Agent:", response)
