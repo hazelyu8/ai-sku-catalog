@@ -25,7 +25,7 @@ def process_latest_file(folder="data/specs/"):
             glob.glob(os.path.join(folder, "*.jpeg")) + \
             glob.glob(os.path.join(folder, "*.png"))
     if not files:
-        return "❌ No files found in data/specs/"
+        return "No files found in data/specs/"
     latest = max(files, key=os.path.getmtime)
     return process_vendor_file(latest)
 
@@ -37,9 +37,9 @@ def get_last_sku():
     row = cur.fetchone()
     conn.close()
     if row:
-        return f"📦 Last entry → SKU: {row[0]}, Lot: {row[1]}, Qty: {row[2]}, Date: {row[3]}"
+        return f"Last entry → SKU: {row[0]}, Lot: {row[1]}, Qty: {row[2]}, Date: {row[3]}"
     else:
-        return "❌ No SKUs found in database."
+        return "No SKUs found in database."
 
 # ------------------------
 # 2. Define tools for the agent
