@@ -3,6 +3,7 @@ import sqlite3
 import pytesseract
 from PIL import Image
 from docx import Document
+import re
 import pandas as pd
 import openpyxl
 import os
@@ -17,32 +18,29 @@ def extract_text_from_image(image_file):
     return text
 
 def extract_text_from_docx(docx_file):
-    """Extract both paragraph and table text from DOCX."""
+    """Extract text from .docx files, including tables."""
     doc = Document(docx_file)
-    text_parts = []
+    text = []
 
-    # Paragraphs
+    # Regular paragraphs
     for para in doc.paragraphs:
         if para.text.strip():
-            text_parts.append(para.text.strip())
+            text.append(para.text.strip())
 
-    # Tables
+    # Text inside tables
     for table in doc.tables:
         for row in table.rows:
             cells = [cell.text.strip() for cell in row.cells if cell.text.strip()]
-            if len(cells) == 2:
-                # Format "Key: Value"
-                text_parts.append(f"{cells[0]} {cells[1]}")
-            elif cells:
-                text_parts.append(" | ".join(cells))
+            if cells:
+                text.append(" | ".join(cells))
 
-    return "\n".join(text_parts)
+    return "\n".join(text)
 
 # ------------------------
-# 2. Parse Fields
+# 2. Parse Fields (Regex)
 # ------------------------
 def parse_vendor_doc(text):
-    """Parse structured fields from vendor doc."""
+    """Parse structured fields (Customer, SKU, Qty, etc.) from the extracted text."""
     fields = {
         "Customer": None,
         "Product Description": None,
@@ -52,20 +50,28 @@ def parse_vendor_doc(text):
         "Qty": None
     }
 
-    # Table-based documents: look for "Label: Value"
-    for line in text.splitlines():
-        line = line.strip()
-        for key in fields.keys():
-            if line.lower().startswith(key.lower()):
-                parts = line.split(":", 1)
-                if len(parts) == 2:
-                    fields[key] = parts[1].strip()
+    # Handles formats like "Customer | Tarte" or "Customer: Tarte"
+    patterns = {
+        "Customer": r"Customer[:\|\-]?\s*\n?\s*([A-Za-z0-9 \-]+)",
+        "Product Description": r"(?:Product Description|Description)[:\|\-]?\s*\n?\s*([A-Za-z0-9 \-]+)",
+        "Batch/Lot No.": r"(?:Batch|Lot|Batch/Lot No.)[:\|\-]?\s*\n?\s*([A-Za-z0-9\-\_]+)",
+        "Date": r"Date[:\|\-]?\s*\n?\s*([0-9/]+)",
+        "SKU": r"SKU[:\|\-]?\s*\n?\s*([A-Za-z0-9\-\_]+)",
+        "Qty": r"(?:Qty|Quantity)[:\|\-]?\s*\n?\s*([0-9]+)"
+    }
+
+    for key, pattern in patterns.items():
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            fields[key] = match.group(1).strip()
+
     return fields
 
 # ------------------------
 # 3. Save to SQLite
 # ------------------------
 def save_to_db(fields):
+    """Save parsed fields into a SQLite database."""
     conn = sqlite3.connect("sku_catalog.db")
     cur = conn.cursor()
 
@@ -93,31 +99,25 @@ def save_to_db(fields):
     conn.close()
 
 # ------------------------
-# 4. Save to Excel (fixed version)
+# 4. Save to Excel
 # ------------------------
 def save_to_excel(fields, excel_path="data/specs/sample_specs.xlsx", sheet_name="Master Sheet - 12th Floor"):
-    """Safely write fields to Excel, recreating if the file is missing or corrupted."""
+    """Save parsed fields into the Excel sheet."""
     os.makedirs(os.path.dirname(excel_path), exist_ok=True)
 
-    def create_new_excel():
+    if not os.path.exists(excel_path):
+        # Create a new Excel file with headers
         df = pd.DataFrame(columns=["Customer", "Product Description", "Batch/Lot No.", "Date", "SKU", "Qty"])
         df.to_excel(excel_path, index=False, sheet_name=sheet_name)
 
-    # Try to open existing workbook
-    try:
-        wb = openpyxl.load_workbook(excel_path)
-    except Exception:
-        create_new_excel()
-        wb = openpyxl.load_workbook(excel_path)
+    wb = openpyxl.load_workbook(excel_path)
 
-    # Ensure correct sheet exists
     if sheet_name not in wb.sheetnames:
         ws = wb.create_sheet(sheet_name)
         ws.append(["Customer", "Product Description", "Batch/Lot No.", "Date", "SKU", "Qty"])
     else:
         ws = wb[sheet_name]
 
-    # Append new entry
     ws.append([
         fields["Customer"], fields["Product Description"], fields["Batch/Lot No."],
         fields["Date"], fields["SKU"], fields["Qty"]
@@ -126,10 +126,10 @@ def save_to_excel(fields, excel_path="data/specs/sample_specs.xlsx", sheet_name=
     wb.save(excel_path)
 
 # ------------------------
-# 5. Streamlit UI
+# 5. Streamlit Interface
 # ------------------------
 st.title("📦 AI-Powered SKU Catalog Agent")
-st.markdown("Upload a vendor document (.docx or image). The app will extract info and automatically save it to Excel + database.")
+st.markdown("Upload a vendor document (.docx or image). The app will extract product info and automatically save it to Excel and the local database.")
 
 uploaded_file = st.file_uploader("Upload a vendor document (JPG, PNG, DOCX)", type=["jpg", "png", "jpeg", "docx"])
 
@@ -145,7 +145,7 @@ if uploaded_file:
     st.subheader("🔎 Extracted Text")
     st.text(text if text.strip() else "(No text detected)")
 
-    # Parse structured fields
+    # Parse text into structured fields
     fields = parse_vendor_doc(text)
     st.subheader("📦 Parsed Fields")
     st.json(fields)
@@ -157,14 +157,4 @@ if uploaded_file:
             save_to_excel(fields)
             st.success("✅ Entry saved to database and Excel successfully!")
         else:
-            st.warning("⚠️ No valid fields detected — please check your document format.")
-
-# ------------------------
-# 6. Optional: Preview DB content
-# ------------------------
-if os.path.exists("sku_catalog.db"):
-    conn = sqlite3.connect("sku_catalog.db")
-    df = pd.read_sql_query("SELECT * FROM sku_catalog", conn)
-    conn.close()
-    st.subheader("📊 Current Database Entries")
-    st.dataframe(df)
+            st.warning("⚠️ No valid fields detected. Please check your document format.")
