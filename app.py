@@ -65,13 +65,14 @@ def parse_vendor_doc(text):
 
 
 # ------------------------
-# 3. Save to SQLite
+# 3. Save to SQLite (skip duplicates)
 # ------------------------
 def save_to_db(fields):
-    """Save parsed data to local SQLite database."""
+    """Save parsed data to local SQLite database — skip duplicates."""
     conn = sqlite3.connect("sku_catalog.db")
     cur = conn.cursor()
 
+    # Create table if it doesn't exist
     cur.execute("""
     CREATE TABLE IF NOT EXISTS sku_catalog (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -84,15 +85,32 @@ def save_to_db(fields):
     )
     """)
 
-    cur.execute("""
-    INSERT INTO sku_catalog (customer, product_desc, batch_lot, date, sku, qty)
-    VALUES (?, ?, ?, ?, ?, ?)
-    """, (
-        fields["Customer"], fields["Product Description"], fields["Batch/Lot No."],
-        fields["Date"], fields["SKU"], fields["Qty"]
-    ))
+    sku = fields["SKU"]
+    batch = fields["Batch/Lot No."]
 
-    conn.commit()
+    # ✅ Check for duplicates (same SKU + Batch/Lot No.)
+    cur.execute("""
+    SELECT COUNT(*) FROM sku_catalog WHERE sku = ? AND batch_lot = ?
+    """, (sku, batch))
+    exists = cur.fetchone()[0]
+
+    if exists > 0:
+        st.warning(f"⚠️ Entry with SKU '{sku}' and Batch '{batch}' already exists. Skipped saving.")
+    else:
+        cur.execute("""
+        INSERT INTO sku_catalog (customer, product_desc, batch_lot, date, sku, qty)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """, (
+            fields["Customer"],
+            fields["Product Description"],
+            fields["Batch/Lot No."],
+            fields["Date"],
+            fields["SKU"],
+            fields["Qty"]
+        ))
+        conn.commit()
+        st.success(f"✅ Saved new entry: SKU {sku}, Batch {batch}")
+
     conn.close()
 
 
@@ -158,7 +176,7 @@ st.markdown("""
 Upload a vendor document (.docx or image).  
 This app will:
 1. Extract key SKU details  
-2. Save them in a database  
+2. Save them in a database (no duplicates!)  
 3. Let you export all entries to Excel
 """)
 
@@ -183,7 +201,6 @@ if uploaded_file:
     if st.button("💾 Save to Database"):
         if any(fields.values()):
             save_to_db(fields)
-            st.success("✅ Entry saved to database!")
         else:
             st.warning("⚠️ No valid fields found — check your document.")
 
