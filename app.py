@@ -7,6 +7,7 @@ import pandas as pd
 import openpyxl
 import os
 
+
 # ------------------------
 # 1. OCR & DOCX Extraction
 # ------------------------
@@ -15,6 +16,7 @@ def extract_text_from_image(image_file):
     img = Image.open(image_file)
     text = pytesseract.image_to_string(img)
     return text
+
 
 def extract_text_from_docx(docx_file):
     """Extract both paragraph and table text from DOCX."""
@@ -31,28 +33,27 @@ def extract_text_from_docx(docx_file):
         for row in table.rows:
             cells = [cell.text.strip() for cell in row.cells if cell.text.strip()]
             if len(cells) == 2:
-                # Format "Key: Value"
                 text_parts.append(f"{cells[0]} {cells[1]}")
             elif cells:
                 text_parts.append(" | ".join(cells))
 
     return "\n".join(text_parts)
 
+
 # ------------------------
 # 2. Parse Fields
 # ------------------------
 def parse_vendor_doc(text):
-    """Parse structured fields from vendor doc."""
+    """Parse structured fields from vendor document text."""
     fields = {
         "Customer": None,
         "Product Description": None,
         "Batch/Lot No.": None,
         "Date": None,
         "SKU": None,
-        "Qty": None
+        "Qty": None,
     }
 
-    # Table-based documents: look for "Label: Value"
     for line in text.splitlines():
         line = line.strip()
         for key in fields.keys():
@@ -62,10 +63,12 @@ def parse_vendor_doc(text):
                     fields[key] = parts[1].strip()
     return fields
 
+
 # ------------------------
 # 3. Save to SQLite
 # ------------------------
 def save_to_db(fields):
+    """Save parsed data to local SQLite database."""
     conn = sqlite3.connect("sku_catalog.db")
     cur = conn.cursor()
 
@@ -92,51 +95,79 @@ def save_to_db(fields):
     conn.commit()
     conn.close()
 
-# ------------------------
-# 4. Save to Excel (fixed version)
-# ------------------------
-def save_to_excel(fields, excel_path="data/specs/sample_specs.xlsx", sheet_name="Master Sheet - 12th Floor"):
-    """Safely write fields to Excel, recreating if the file is missing or corrupted."""
-    os.makedirs(os.path.dirname(excel_path), exist_ok=True)
 
-    def create_new_excel():
-        df = pd.DataFrame(columns=["Customer", "Product Description", "Batch/Lot No.", "Date", "SKU", "Qty"])
-        df.to_excel(excel_path, index=False, sheet_name=sheet_name)
+# ------------------------
+# 4. Export full DB → Excel
+# ------------------------
+def export_db_to_excel(
+    db_path="sku_catalog.db",
+    excel_path="/Users/hazba/Documents/GitHub/rcos-f25/ai-sku-catalog/data/specs/sample_specs.xlsx",
+    sheet_name="Master Sheet - 12th Floor"
+):
+    """Read all database entries and export them into Excel cleanly."""
+    if not os.path.exists(db_path):
+        st.error("❌ Database not found. Upload and save a document first.")
+        return
 
-    # Try to open existing workbook
+    conn = sqlite3.connect(db_path)
+    df = pd.read_sql_query("SELECT * FROM sku_catalog", conn)
+    conn.close()
+
+    if df.empty:
+        st.warning("⚠️ Database is empty — nothing to export yet.")
+        return
+
+    # Remove ID for cleaner Excel layout
+    df = df.drop(columns=["id"])
+
     try:
+        # Open the workbook if it exists
         wb = openpyxl.load_workbook(excel_path)
-    except Exception:
-        create_new_excel()
-        wb = openpyxl.load_workbook(excel_path)
+        if sheet_name not in wb.sheetnames:
+            ws = wb.create_sheet(sheet_name)
+        else:
+            ws = wb[sheet_name]
 
-    # Ensure correct sheet exists
-    if sheet_name not in wb.sheetnames:
-        ws = wb.create_sheet(sheet_name)
-        ws.append(["Customer", "Product Description", "Batch/Lot No.", "Date", "SKU", "Qty"])
-    else:
-        ws = wb[sheet_name]
+        # Clear any old data (optional)
+        for row in ws["A2:F1000"]:
+            for cell in row:
+                cell.value = None
 
-    # Append new entry
-    ws.append([
-        fields["Customer"], fields["Product Description"], fields["Batch/Lot No."],
-        fields["Date"], fields["SKU"], fields["Qty"]
-    ])
+        # Write headers
+        headers = ["Customer", "Product Description", "Batch/Lot No.", "Date", "SKU", "Qty"]
+        for col, header in enumerate(headers, start=1):
+            ws.cell(row=1, column=col, value=header)
 
-    wb.save(excel_path)
+        # Write database rows starting at row 2
+        for row_idx, row_data in enumerate(df.values, start=2):
+            for col_idx, value in enumerate(row_data, start=1):
+                ws.cell(row=row_idx, column=col_idx, value=value)
+
+        wb.save(excel_path)
+        st.success(f"✅ Exported {len(df)} rows from database to '{sheet_name}' in Excel!")
+
+    except Exception as e:
+        st.error(f"❌ Could not export to Excel. Make sure the file is closed.\n\nError: {e}")
+
 
 # ------------------------
 # 5. Streamlit UI
 # ------------------------
 st.title("📦 AI-Powered SKU Catalog Agent")
-st.markdown("Upload a vendor document (.docx or image). The app will extract info and automatically save it to Excel + database.")
+st.markdown("""
+Upload a vendor document (.docx or image).  
+This app will:
+1. Extract key SKU details  
+2. Save them in a database  
+3. Let you export all entries to Excel
+""")
 
-uploaded_file = st.file_uploader("Upload a vendor document (JPG, PNG, DOCX)", type=["jpg", "png", "jpeg", "docx"])
+uploaded_file = st.file_uploader("Upload a vendor document (JPG, PNG, DOCX)",
+                                 type=["jpg", "png", "jpeg", "docx"])
 
 if uploaded_file:
     st.success("✅ File uploaded successfully!")
 
-    # Extract text
     if uploaded_file.type in ["image/jpeg", "image/png"]:
         text = extract_text_from_image(uploaded_file)
     else:
@@ -145,26 +176,27 @@ if uploaded_file:
     st.subheader("🔎 Extracted Text")
     st.text(text if text.strip() else "(No text detected)")
 
-    # Parse structured fields
     fields = parse_vendor_doc(text)
     st.subheader("📦 Parsed Fields")
     st.json(fields)
 
-    # Save button
-    if st.button("💾 Save to Database & Excel"):
+    if st.button("💾 Save to Database"):
         if any(fields.values()):
             save_to_db(fields)
-            save_to_excel(fields)
-            st.success("✅ Entry saved to database and Excel successfully!")
+            st.success("✅ Entry saved to database!")
         else:
-            st.warning("⚠️ No valid fields detected — please check your document format.")
+            st.warning("⚠️ No valid fields found — check your document.")
 
-# ------------------------
-# 6. Optional: Preview DB content
-# ------------------------
+
+# Export button
+if st.button("📤 Export Database to Excel"):
+    export_db_to_excel()
+
+# Preview DB
 if os.path.exists("sku_catalog.db"):
     conn = sqlite3.connect("sku_catalog.db")
     df = pd.read_sql_query("SELECT * FROM sku_catalog", conn)
     conn.close()
-    st.subheader("📊 Current Database Entries")
-    st.dataframe(df)
+    if not df.empty:
+        st.subheader("📊 Current Database Entries")
+        st.dataframe(df.tail(10))
