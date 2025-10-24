@@ -6,29 +6,26 @@ from docx import Document
 import pandas as pd
 import openpyxl
 import os
+import shutil
 
-
-# ------------------------
+# ===============================================================
 # 1. OCR & DOCX Extraction
-# ------------------------
+# ===============================================================
 def extract_text_from_image(image_file):
     """Extract text from an uploaded image using OCR."""
     img = Image.open(image_file)
     text = pytesseract.image_to_string(img)
     return text
 
-
 def extract_text_from_docx(docx_file):
     """Extract both paragraph and table text from DOCX."""
     doc = Document(docx_file)
     text_parts = []
 
-    # Paragraphs
     for para in doc.paragraphs:
         if para.text.strip():
             text_parts.append(para.text.strip())
 
-    # Tables
     for table in doc.tables:
         for row in table.rows:
             cells = [cell.text.strip() for cell in row.cells if cell.text.strip()]
@@ -39,14 +36,12 @@ def extract_text_from_docx(docx_file):
 
     return "\n".join(text_parts)
 
-
-# ------------------------
+# ===============================================================
 # 2. Parse Fields
-# ------------------------
+# ===============================================================
 def parse_vendor_doc(text):
     """Parse structured fields from vendor document text."""
     fields = {
-        "Customer": None,
         "Product Description": None,
         "Batch/Lot No.": None,
         "Date": None,
@@ -63,20 +58,17 @@ def parse_vendor_doc(text):
                     fields[key] = parts[1].strip()
     return fields
 
-
-# ------------------------
-# 3. Save to SQLite (skip duplicates)
-# ------------------------
+# ===============================================================
+# 3. Database Operations
+# ===============================================================
 def save_to_db(fields):
     """Save parsed data to local SQLite database — skip duplicates."""
     conn = sqlite3.connect("sku_catalog.db")
     cur = conn.cursor()
 
-    # Create table if it doesn't exist
     cur.execute("""
     CREATE TABLE IF NOT EXISTS sku_catalog (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        customer TEXT,
         product_desc TEXT,
         batch_lot TEXT,
         date TEXT,
@@ -88,20 +80,17 @@ def save_to_db(fields):
     sku = fields["SKU"]
     batch = fields["Batch/Lot No."]
 
-    # ✅ Check for duplicates (same SKU + Batch/Lot No.)
-    cur.execute("""
-    SELECT COUNT(*) FROM sku_catalog WHERE sku = ? AND batch_lot = ?
-    """, (sku, batch))
+    # Check for duplicates
+    cur.execute("SELECT COUNT(*) FROM sku_catalog WHERE sku = ? AND batch_lot = ?", (sku, batch))
     exists = cur.fetchone()[0]
 
     if exists > 0:
         st.warning(f"⚠️ Entry with SKU '{sku}' and Batch '{batch}' already exists. Skipped saving.")
     else:
         cur.execute("""
-        INSERT INTO sku_catalog (customer, product_desc, batch_lot, date, sku, qty)
-        VALUES (?, ?, ?, ?, ?, ?)
+        INSERT INTO sku_catalog (product_desc, batch_lot, date, sku, qty)
+        VALUES (?, ?, ?, ?, ?)
         """, (
-            fields["Customer"],
             fields["Product Description"],
             fields["Batch/Lot No."],
             fields["Date"],
@@ -110,87 +99,134 @@ def save_to_db(fields):
         ))
         conn.commit()
         st.success(f"✅ Saved new entry: SKU {sku}, Batch {batch}")
-
     conn.close()
 
+def clear_database():
+    conn = sqlite3.connect("sku_catalog.db")
+    cur = conn.cursor()
+    cur.execute("DELETE FROM sku_catalog;")
+    conn.commit()
+    conn.close()
 
-# ------------------------
-# 4. Export full DB → Excel
-# ------------------------
-def export_db_to_excel(
-    db_path="sku_catalog.db",
-    excel_path="/Users/hazba/Documents/GitHub/rcos-f25/ai-sku-catalog/data/specs/sample_specs.xlsx",
+# ===============================================================
+# 4. Save to Excel
+# ===============================================================
+def save_to_excel(
+    fields,
+    excel_path="data/specs/sample_specs.xlsx",
     sheet_name="Master Sheet - 12th Floor"
 ):
-    """Read all database entries and export them into Excel cleanly."""
-    if not os.path.exists(db_path):
-        st.error("❌ Database not found. Upload and save a document first.")
+    """Write parsed data into Excel sheet starting at row 757."""
+    import openpyxl
+
+    if not os.path.exists(excel_path):
+        st.error(f"❌ Excel file not found at: {excel_path}")
         return
 
-    conn = sqlite3.connect(db_path)
-    df = pd.read_sql_query("SELECT * FROM sku_catalog", conn)
-    conn.close()
-
-    if df.empty:
-        st.warning("⚠️ Database is empty — nothing to export yet.")
-        return
-
-    # Remove ID for cleaner Excel layout
-    df = df.drop(columns=["id"])
+    temp_copy = excel_path.replace(".xlsx", "_temp.xlsx")
+    shutil.copyfile(excel_path, temp_copy)
 
     try:
-        # Open the workbook if it exists
-        wb = openpyxl.load_workbook(excel_path)
-        if sheet_name not in wb.sheetnames:
-            ws = wb.create_sheet(sheet_name)
-        else:
-            ws = wb[sheet_name]
-
-        # Clear any old data (optional)
-        for row in ws["A2:F1000"]:
-            for cell in row:
-                cell.value = None
-
-        # Write headers
-        headers = ["Customer", "Product Description", "Batch/Lot No.", "Date", "SKU", "Qty"]
-        for col, header in enumerate(headers, start=1):
-            ws.cell(row=1, column=col, value=header)
-
-        # Write database rows starting at row 2
-        for row_idx, row_data in enumerate(df.values, start=2):
-            for col_idx, value in enumerate(row_data, start=1):
-                ws.cell(row=row_idx, column=col_idx, value=value)
-
-        wb.save(excel_path)
-        st.success(f"✅ Exported {len(df)} rows from database to '{sheet_name}' in Excel!")
-
+        wb = openpyxl.load_workbook(temp_copy)
     except Exception as e:
-        st.error(f"❌ Could not export to Excel. Make sure the file is closed.\n\nError: {e}")
+        st.error(f"❌ Could not open Excel file. Make sure it's a valid .xlsx and not open in Excel.\n\nError: {e}")
+        return
 
+    if sheet_name not in wb.sheetnames:
+        st.error(f"❌ Sheet '{sheet_name}' not found. Available sheets: {wb.sheetnames}")
+        return
 
-# ------------------------
+    ws = wb[sheet_name]
+    target_row = 757
+
+    # Fill empty rows up to 757
+    if ws.max_row < target_row:
+        for _ in range(ws.max_row, target_row - 1):
+            ws.append([])
+
+    # Insert data (no Customer)
+    data = [
+        fields.get("Product Description"),
+        fields.get("Batch/Lot No."),
+        fields.get("Date"),
+        fields.get("SKU"),
+        fields.get("Qty"),
+    ]
+
+    for col, value in enumerate(data, start=1):
+        ws.cell(row=target_row, column=col, value=value)
+
+    wb.save(temp_copy)
+    shutil.move(temp_copy, excel_path)
+    st.info(f"✅ Data inserted into row {target_row} of '{sheet_name}'")
+
+# ===============================================================
 # 5. Streamlit UI
-# ------------------------
-st.title("📦 AI-Powered SKU Catalog Agent")
+# ===============================================================
+st.title("🤖 AI SKU Agent — Offline Chat Mode")
+
 st.markdown("""
-Upload a vendor document (.docx or image).  
-This app will:
-1. Extract key SKU details  
-2. Save them in a database (no duplicates!)  
-3. Let you export all entries to Excel
+Welcome to your **AI-Powered SKU Catalog Agent**!  
+You can either upload a document manually below **or chat** with your agent:
+- Type **"process the new SKU doc"** to process the latest file in `data/specs/`
+- Type **"show database"** to display current entries
+- Type **"clear database"** to reset all records
 """)
 
-uploaded_file = st.file_uploader("Upload a vendor document (JPG, PNG, DOCX)",
-                                 type=["jpg", "png", "jpeg", "docx"])
+# ------------------- Chat Memory -------------------
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+
+for msg in st.session_state.messages:
+    with st.chat_message(msg["role"]):
+        st.markdown(msg["content"])
+
+user_input = st.chat_input("Type a message (e.g., 'process the new SKU doc')")
+
+# ------------------- Chat Agent Logic -------------------
+if user_input:
+    st.session_state.messages.append({"role": "user", "content": user_input})
+    response = None
+
+    if "process" in user_input.lower():
+        folder = "data/specs/"
+        files = [os.path.join(folder, f) for f in os.listdir(folder) if f.endswith((".docx", ".jpg", ".png", ".jpeg"))]
+        if not files:
+            response = "❌ No files found in data/specs/."
+        else:
+            latest = max(files, key=os.path.getmtime)
+            text = extract_text_from_docx(latest) if latest.endswith(".docx") else extract_text_from_image(latest)
+            fields = parse_vendor_doc(text)
+            save_to_db(fields)
+            save_to_excel(fields)
+            response = f"✅ Added SKU {fields.get('SKU')} (Batch {fields.get('Batch/Lot No.')}) to Master Sheet."
+
+    elif "show" in user_input.lower() and "database" in user_input.lower():
+        conn = sqlite3.connect("sku_catalog.db")
+        df = pd.read_sql_query("SELECT * FROM sku_catalog", conn)
+        conn.close()
+        st.dataframe(df)
+        response = "📊 Here's your current database."
+
+    elif "clear" in user_input.lower() and "database" in user_input.lower():
+        clear_database()
+        response = "🧹 Database cleared successfully."
+
+    else:
+        response = "🤖 I can process new SKU docs, show the database, or clear it."
+
+    st.session_state.messages.append({"role": "assistant", "content": response})
+
+# ------------------- Manual Upload Mode -------------------
+st.divider()
+st.header("📄 Manual Upload Mode")
+
+uploaded_file = st.file_uploader("Upload a vendor document (JPG, PNG, DOCX)", type=["jpg", "png", "jpeg", "docx"])
 
 if uploaded_file:
     st.success("✅ File uploaded successfully!")
 
-    if uploaded_file.type in ["image/jpeg", "image/png"]:
-        text = extract_text_from_image(uploaded_file)
-    else:
-        text = extract_text_from_docx(uploaded_file)
-
+    text = extract_text_from_docx(uploaded_file) if uploaded_file.type == "application/vnd.openxmlformats-officedocument.wordprocessingml.document" else extract_text_from_image(uploaded_file)
     st.subheader("🔎 Extracted Text")
     st.text(text if text.strip() else "(No text detected)")
 
@@ -198,22 +234,10 @@ if uploaded_file:
     st.subheader("📦 Parsed Fields")
     st.json(fields)
 
-    if st.button("💾 Save to Database"):
+    if st.button("💾 Save to Database & Excel"):
         if any(fields.values()):
             save_to_db(fields)
+            save_to_excel(fields)
+            st.success("✅ Data saved successfully to both Database and Excel!")
         else:
-            st.warning("⚠️ No valid fields found — check your document.")
-
-
-# Export button
-if st.button("📤 Export Database to Excel"):
-    export_db_to_excel()
-
-# Preview DB
-if os.path.exists("sku_catalog.db"):
-    conn = sqlite3.connect("sku_catalog.db")
-    df = pd.read_sql_query("SELECT * FROM sku_catalog", conn)
-    conn.close()
-    if not df.empty:
-        st.subheader("📊 Current Database Entries")
-        st.dataframe(df.tail(10))
+            st.warning("⚠️ No valid fields detected — please check your document format.")
